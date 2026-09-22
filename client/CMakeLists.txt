@@ -1,0 +1,5 @@
+file(GLOB BLUEBOAT_CLIENT_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp)
+add_library(blueboat_client STATIC ${BLUEBOAT_CLIENT_SOURCES})
+target_include_directories(blueboat_client PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_features(blueboat_client PUBLIC cxx_std_20)
+target_link_libraries(blueboat_client PUBLIC blueboat_common)

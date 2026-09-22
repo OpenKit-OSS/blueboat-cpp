@@ -1,0 +1,2 @@
+add_executable(blueboat_chat_client_example main.cpp)
+target_link_libraries(blueboat_chat_client_example PRIVATE blueboat_client)

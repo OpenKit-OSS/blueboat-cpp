@@ -1,0 +1,2 @@
+add_executable(blueboat_chat_server_example main.cpp chat_room.cpp)
+target_link_libraries(blueboat_chat_server_example PRIVATE blueboat_server)
