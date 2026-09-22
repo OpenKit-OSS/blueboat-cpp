@@ -17,7 +17,9 @@
 #include "blueboat/common/protocol.hpp"
 #include "blueboat/common/random_id.hpp"
 #include "blueboat/common/sio_protocol.hpp"
+#include "blueboat/common/socket.hpp"
 #include "blueboat/common/tcp.hpp"
+#include "blueboat/common/tls_socket.hpp"
 #include "blueboat/common/ws_connection.hpp"
 #include "blueboat/common/ws_handshake.hpp"
 #include "blueboat/game_lock.hpp"
@@ -82,7 +84,11 @@ std::string base64_decode(const std::string &in) {
 
 Server::Server(ServerOptions options)
     : storage_(std::move(options.storage)), pubsub_(std::move(options.pubsub)), game_values_(*storage_), room_fetcher_(*storage_), admins_(std::move(options.admins)),
-      custom_room_id_generator_(std::move(options.custom_room_id_generator)), on_dispose_(std::move(options.on_dispose)) {}
+      custom_room_id_generator_(std::move(options.custom_room_id_generator)), on_dispose_(std::move(options.on_dispose)) {
+  if (options.tls) {
+    tls_ctx_ = TlsContext::create_server(options.tls->cert_file, options.tls->key_file);
+  }
+}
 
 Server::~Server() {
   if (!shutting_down_.load()) {
@@ -117,7 +123,19 @@ void Server::accept_loop() {
     if (fd < 0) {
       continue;
     }
-    std::thread(&Server::handle_connection, this, fd).detach();
+
+    std::unique_ptr<Socket> sock;
+    if (tls_ctx_) {
+      auto tls_sock = std::make_unique<TlsSocket>(fd, tls_ctx_);
+      if (!tls_sock->accept_server()) {
+        continue;
+      }
+      sock = std::move(tls_sock);
+    } else {
+      sock = std::make_unique<PlainSocket>(fd);
+    }
+
+    std::thread(&Server::handle_connection, this, std::move(sock)).detach();
   }
 }
 
@@ -181,7 +199,7 @@ void Server::send_frame_to_client(const std::string &session_id, const std::stri
 
 void Server::on_room_disposed(const std::string &room_id) { managing_rooms_.erase(room_id); }
 
-Room *Server::create_new_room(const SimpleClient &client, const std::string &room_name, const Value &creator_options) {
+Room *Server::create_new_room(const SimpleClient &client, const std::string &room_name, const Value &creator_options, const std::string &room_id_override) {
   auto type_it = registered_rooms_.find(room_name);
   if (type_it == registered_rooms_.end()) {
     throw std::runtime_error(room_name + " does not have a room handler");
@@ -189,14 +207,21 @@ Room *Server::create_new_room(const SimpleClient &client, const std::string &roo
 
   auto existing_ids = room_fetcher_.get_list_of_rooms();
   std::string room_id;
-  for (int i = 0; i < 3 && room_id.empty(); i++) {
-    std::string candidate = custom_room_id_generator_ ? custom_room_id_generator_(room_name, type_it->second.options, creator_options) : random_id();
-    if (std::find(existing_ids.begin(), existing_ids.end(), candidate) == existing_ids.end()) {
-      room_id = candidate;
+  if (!room_id_override.empty()) {
+    if (std::find(existing_ids.begin(), existing_ids.end(), room_id_override) != existing_ids.end()) {
+      throw std::runtime_error("Room ID already in use: " + room_id_override);
     }
-  }
-  if (room_id.empty()) {
-    throw std::runtime_error("Failed to create room with unique ID");
+    room_id = room_id_override;
+  } else {
+    for (int i = 0; i < 3 && room_id.empty(); i++) {
+      std::string candidate = custom_room_id_generator_ ? custom_room_id_generator_(room_name, type_it->second.options, creator_options) : random_id();
+      if (std::find(existing_ids.begin(), existing_ids.end(), candidate) == existing_ids.end()) {
+        room_id = candidate;
+      }
+    }
+    if (room_id.empty()) {
+      throw std::runtime_error("Failed to create room with unique ID");
+    }
   }
 
   auto room = type_it->second.factory();
@@ -223,6 +248,13 @@ Room *Server::create_new_room(const SimpleClient &client, const std::string &roo
   Room *raw = room.get();
   managing_rooms_[room_id] = std::move(room);
   return raw;
+}
+
+std::string Server::create_room(const std::string &room_name, const std::string &room_id, const Value &creator_options) {
+  detail::GameLockGuard guard;
+  SimpleClient synthetic_owner{"", "", "", ""};
+  Room *room = create_new_room(synthetic_owner, room_name, creator_options, room_id);
+  return room->room_id;
 }
 
 void Server::handle_client_message(const SimpleClient &client, const std::string &event, const Value &data_in) {
@@ -280,23 +312,21 @@ void Server::handle_client_disconnect(const std::string &session_id) {
   pubsub_->publish(protocol::pubsub_listeners::PLAYER_LEFT, session_id);
 }
 
-void Server::handle_connection(int fd) {
-  auto request = http::read_request(fd);
+void Server::handle_connection(std::unique_ptr<Socket> sock) {
+  auto request = http::read_request(*sock);
   if (!request) {
-    ::close(fd);
     return;
   }
 
   if (request->path != "/blueboat" && request->path != "/blueboat/") {
-    handle_admin_request(fd, *request);
+    handle_admin_request(*sock, *request);
     return;
   }
 
   auto upgrade_it = request->headers.find("upgrade");
   auto key_it = request->headers.find("sec-websocket-key");
   if (request->method != "GET" || upgrade_it == request->headers.end() || !header_contains_token(upgrade_it->second, "websocket") || key_it == request->headers.end()) {
-    http::write_response(fd, 400, "Bad Request", "text/plain", "Expected a WebSocket upgrade request");
-    ::close(fd);
+    http::write_response(*sock, 400, "Bad Request", "text/plain", "Expected a WebSocket upgrade request");
     return;
   }
 
@@ -306,8 +336,7 @@ void Server::handle_connection(int fd) {
                          "Connection: Upgrade\r\n"
                          "Sec-WebSocket-Accept: " +
                          accept + "\r\n\r\n";
-  if (::send(fd, response.data(), response.size(), MSG_NOSIGNAL) < 0) {
-    ::close(fd);
+  if (sock->write(response.data(), response.size()) < 0) {
     return;
   }
 
@@ -316,9 +345,9 @@ void Server::handle_connection(int fd) {
   std::string session_id = random_id();
   std::string origin = request->headers.count("origin") ? request->headers.at("origin") : "";
 
-  SimpleClient client_info{id, session_id, origin, peer_ip(fd)};
+  SimpleClient client_info{id, session_id, origin, peer_ip(sock->raw_fd())};
 
-  WsConnection ws(fd, /*is_client=*/false);
+  WsConnection ws(std::move(sock), /*is_client=*/false);
   {
     detail::GameLockGuard guard;
     connections_[session_id] = Connection{&ws, client_info};
@@ -404,29 +433,27 @@ bool Server::check_basic_auth(const http::Request &request) const {
   return admin_it != admins_.end() && admin_it->second == pass;
 }
 
-void Server::handle_admin_request(int fd, const http::Request &request) {
+void Server::handle_admin_request(Socket &sock, const http::Request &request) {
   if (request.path.rfind(ADMIN_PREFIX, 0) != 0) {
-    http::write_response(fd, 404, "Not Found", "text/plain", "Not found");
-    ::close(fd);
+    http::write_response(sock, 404, "Not Found", "text/plain", "Not found");
     return;
   }
 
   if (!check_basic_auth(request)) {
-    http::write_response(fd, 401, "Unauthorized", "text/plain", "Authentication required", {{"WWW-Authenticate", "Basic realm=\"blueboat\""}});
-    ::close(fd);
+    http::write_response(sock, 401, "Unauthorized", "text/plain", "Authentication required", {{"WWW-Authenticate", "Basic realm=\"blueboat\""}});
     return;
   }
 
   std::string route = request.path.substr(std::string(ADMIN_PREFIX).size());
 
   if (request.method == "GET" && (route.empty() || route == "/")) {
-    http::write_response(fd, 200, "OK", "application/json", Value{{"message", "blueboat-cpp admin API. The bundled dashboard UI was not ported."}}.dump());
+    http::write_response(sock, 200, "OK", "application/json", Value{{"message", "blueboat-cpp admin API. The bundled dashboard UI was not ported."}}.dump());
   } else if (request.method == "GET" && route == "/rooms") {
     Value rooms = Value::array();
     for (auto &room : get_rooms()) {
       rooms.push_back(room);
     }
-    http::write_response(fd, 200, "OK", "application/json", rooms.dump());
+    http::write_response(sock, 200, "OK", "application/json", rooms.dump());
   } else if (request.method == "GET" && route.rfind("/rooms/", 0) == 0) {
     std::string room_id = route.substr(std::string("/rooms/").size());
 
@@ -456,45 +483,44 @@ void Server::handle_admin_request(int fd, const http::Request &request) {
       sub.unsubscribe();
     }
     if (!got) {
-      http::write_response(fd, 404, "Not Found", "text/plain", "No room found");
+      http::write_response(sock, 404, "Not Found", "text/plain", "No room found");
     } else {
-      http::write_response(fd, 200, "OK", "application/json", result.dump());
+      http::write_response(sock, 200, "OK", "application/json", result.dump());
     }
   } else if (request.method == "GET" && route == "/gameValues") {
     detail::GameLockGuard guard;
-    http::write_response(fd, 200, "OK", "application/json", game_values_.get_all().dump());
+    http::write_response(sock, 200, "OK", "application/json", game_values_.get_all().dump());
   } else if (request.method == "POST" && route == "/gameValues") {
     try {
       Value body = Value::parse(request.body);
       detail::GameLockGuard guard;
       game_values_.set_all(body);
-      http::write_response(fd, 200, "OK", "text/plain", "OK");
+      http::write_response(sock, 200, "OK", "text/plain", "OK");
     } catch (const std::exception &e) {
-      http::write_response(fd, 500, "Internal Server Error", "application/json", json_error(e.what()));
+      http::write_response(sock, 500, "Internal Server Error", "application/json", json_error(e.what()));
     }
   } else if (request.method == "POST" && route == "/external-message") {
     try {
       Value body = Value::parse(request.body);
       if (!body.contains("key") || !body["key"].is_string()) {
-        http::write_response(fd, 500, "Internal Server Error", "text/plain", "Key property required for external messages");
+        http::write_response(sock, 500, "Internal Server Error", "text/plain", "Key property required for external messages");
       } else if (!body.contains("room") || !body["room"].is_string()) {
-        http::write_response(fd, 500, "Internal Server Error", "text/plain", "Room property required for external messages");
+        http::write_response(sock, 500, "Internal Server Error", "text/plain", "Room property required for external messages");
       } else {
         detail::GameLockGuard guard;
         pubsub_->publish(
           body["room"].get<std::string>(),
           Value{{"action", protocol::pubsub_listeners::EXTERNAL_MESSAGE}, {"data", Value{{"key", body["key"]}, {"data", body.value("data", Value())}}}}
         );
-        http::write_response(fd, 200, "OK", "text/plain", "OK");
+        http::write_response(sock, 200, "OK", "text/plain", "OK");
       }
     } catch (const std::exception &e) {
-      http::write_response(fd, 500, "Internal Server Error", "application/json", json_error(e.what()));
+      http::write_response(sock, 500, "Internal Server Error", "application/json", json_error(e.what()));
     }
   } else {
-    http::write_response(fd, 404, "Not Found", "text/plain", "Not found");
+    http::write_response(sock, 404, "Not Found", "text/plain", "Not found");
   }
 
-  ::close(fd);
 }
 
 } // namespace blueboat

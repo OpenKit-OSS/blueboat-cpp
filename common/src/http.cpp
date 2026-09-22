@@ -1,8 +1,5 @@
 #include "blueboat/common/http.hpp"
 
-#include <sys/socket.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <cctype>
 #include <sstream>
@@ -13,11 +10,11 @@ namespace {
 constexpr std::size_t MAX_HEADER_SIZE = 64 * 1024;
 constexpr std::size_t MAX_BODY_SIZE = 8 * 1024 * 1024;
 
-std::optional<std::string> read_until_double_crlf(int fd) {
+std::optional<std::string> read_until_double_crlf(Socket &sock) {
   std::string buf;
   char c;
   while (buf.size() < MAX_HEADER_SIZE) {
-    ssize_t n = ::recv(fd, &c, 1, 0);
+    long n = sock.read(&c, 1);
     if (n <= 0) {
       return std::nullopt;
     }
@@ -44,8 +41,8 @@ std::string trim(const std::string &s) {
 }
 } // namespace
 
-std::optional<Request> read_request(int fd) {
-  auto raw = read_until_double_crlf(fd);
+std::optional<Request> read_request(Socket &sock) {
+  auto raw = read_until_double_crlf(sock);
   if (!raw) {
     return std::nullopt;
   }
@@ -104,7 +101,7 @@ std::optional<Request> read_request(int fd) {
     req.body.resize(content_length);
     std::size_t received = 0;
     while (received < content_length) {
-      ssize_t n = ::recv(fd, req.body.data() + received, content_length - received, 0);
+      long n = sock.read(req.body.data() + received, content_length - received);
       if (n <= 0) {
         return std::nullopt;
       }
@@ -131,7 +128,8 @@ std::map<std::string, std::string> parse_query(const std::string &query) {
 }
 
 void write_response(
-  int fd, int status, const std::string &status_text, const std::string &content_type, const std::string &body, const std::map<std::string, std::string> &extra_headers
+  Socket &sock, int status, const std::string &status_text, const std::string &content_type, const std::string &body,
+  const std::map<std::string, std::string> &extra_headers
 ) {
   std::ostringstream out;
   out << "HTTP/1.1 " << status << " " << status_text << "\r\n";
@@ -146,7 +144,7 @@ void write_response(
   std::string data = out.str();
   std::size_t sent = 0;
   while (sent < data.size()) {
-    ssize_t n = ::send(fd, data.data() + sent, data.size() - sent, MSG_NOSIGNAL);
+    long n = sock.write(data.data() + sent, data.size() - sent);
     if (n <= 0) {
       return;
     }

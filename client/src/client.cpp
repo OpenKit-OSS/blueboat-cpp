@@ -260,7 +260,7 @@ void Client::connection_manager_loop() {
 
     ping_interval_ms_ = 25000;
 
-    auto ws = std::make_unique<blueboat::WsConnection>(fd, /*is_client=*/true);
+    auto ws = std::make_unique<blueboat::WsConnection>(std::make_unique<blueboat::PlainSocket>(fd), /*is_client=*/true);
     ws->set_message_handler([this](bool is_binary, const std::string &payload) { handle_ws_payload(is_binary, payload); });
     ws->set_close_handler([] {});
 

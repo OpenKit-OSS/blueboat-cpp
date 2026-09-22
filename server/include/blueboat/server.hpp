@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -26,6 +27,13 @@ struct Request;
 namespace blueboat {
 
 class WsConnection;
+class Socket;
+class TlsContext;
+
+struct TlsOptions {
+  std::string cert_file;
+  std::string key_file;
+};
 
 struct ServerOptions {
   std::unique_ptr<Storage> storage;
@@ -33,6 +41,7 @@ struct ServerOptions {
   std::map<std::string, std::string> admins;
   std::function<std::string(const std::string &room_name, const Value &room_options, const Value &creator_options)> custom_room_id_generator;
   std::function<void()> on_dispose;
+  std::optional<TlsOptions> tls;
 };
 
 using RoomFactory = std::function<std::unique_ptr<Room>()>;
@@ -46,6 +55,8 @@ public:
   Server &operator=(const Server &) = delete;
 
   void register_room(const std::string &room_name, RoomFactory factory, Value room_options = Value::object());
+
+  std::string create_room(const std::string &room_name, const std::string &room_id = "", const Value &creator_options = Value::object());
 
   void listen(int port);
 
@@ -71,16 +82,16 @@ private:
   };
 
   void accept_loop();
-  void handle_connection(int fd);
+  void handle_connection(std::unique_ptr<Socket> sock);
   void handle_ws_payload(const SimpleClient &client, bool is_binary, const std::string &payload);
   void handle_client_message(const SimpleClient &client, const std::string &event, const Value &data);
   void handle_client_disconnect(const std::string &session_id);
 
-  Room *create_new_room(const SimpleClient &client, const std::string &room_name, const Value &creator_options);
+  Room *create_new_room(const SimpleClient &client, const std::string &room_name, const Value &creator_options, const std::string &room_id_override = "");
   void on_room_disposed(const std::string &room_id);
   void send_frame_to_client(const std::string &session_id, const std::string &event, const Value &data);
 
-  void handle_admin_request(int fd, const http::Request &request);
+  void handle_admin_request(Socket &sock, const http::Request &request);
   bool check_basic_auth(const http::Request &request) const;
 
   std::unique_ptr<Storage> storage_;
@@ -90,6 +101,7 @@ private:
   std::map<std::string, std::string> admins_;
   std::function<std::string(const std::string &, const Value &, const Value &)> custom_room_id_generator_;
   std::function<void()> on_dispose_;
+  std::shared_ptr<TlsContext> tls_ctx_;
 
   std::unordered_map<std::string, RegisteredRoomType> registered_rooms_;
   std::unordered_map<std::string, std::unique_ptr<Room>> managing_rooms_;

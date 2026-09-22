@@ -3,9 +3,12 @@
 #include <wslay/wslay.h>
 
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
+
+#include "blueboat/common/socket.hpp"
 
 namespace blueboat {
 
@@ -13,7 +16,7 @@ class WsConnection {
 public:
   using CloseHandler = std::function<void()>;
 
-  WsConnection(int fd, bool is_client);
+  WsConnection(std::unique_ptr<Socket> socket, bool is_client);
   ~WsConnection();
 
   WsConnection(const WsConnection &) = delete;
@@ -31,7 +34,7 @@ public:
 
   void run_recv_loop(std::function<void()> on_idle = nullptr);
 
-  int fd() const { return fd_; }
+  int fd() const { return socket_->raw_fd(); }
 
 private:
   static ssize_t recv_cb(wslay_event_context_ptr ctx, uint8_t *buf, size_t len, int flags, void *user_data);
@@ -39,7 +42,7 @@ private:
   static int genmask_cb(wslay_event_context_ptr ctx, uint8_t *buf, size_t len, void *user_data);
   static void on_msg_recv_cb(wslay_event_context_ptr ctx, const wslay_event_on_msg_recv_arg *arg, void *user_data);
 
-  int fd_;
+  std::unique_ptr<Socket> socket_;
   bool is_client_;
   wslay_event_context_ptr ctx_ = nullptr;
   std::recursive_mutex io_mutex_;

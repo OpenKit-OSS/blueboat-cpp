@@ -10,7 +10,7 @@
 
 namespace blueboat {
 
-WsConnection::WsConnection(int fd, bool is_client) : fd_(fd), is_client_(is_client) {
+WsConnection::WsConnection(std::unique_ptr<Socket> socket, bool is_client) : socket_(std::move(socket)), is_client_(is_client) {
   wslay_event_callbacks callbacks{};
   callbacks.recv_callback = &WsConnection::recv_cb;
   callbacks.send_callback = &WsConnection::send_cb;
@@ -29,10 +29,8 @@ WsConnection::~WsConnection() {
     wslay_event_context_free(ctx_);
     ctx_ = nullptr;
   }
-  if (fd_ >= 0) {
-    ::shutdown(fd_, SHUT_RDWR);
-    ::close(fd_);
-    fd_ = -1;
+  if (socket_) {
+    socket_->shutdown_close();
   }
 }
 
@@ -68,20 +66,18 @@ void WsConnection::close(uint16_t code) {
     wslay_event_queue_close(ctx_, code, nullptr, 0);
     wslay_event_send(ctx_);
   }
-  if (fd_ >= 0) {
-    ::shutdown(fd_, SHUT_RDWR);
-  }
+  socket_->shutdown_close();
 }
 
 void WsConnection::run_recv_loop(std::function<void()> on_idle) {
   if (on_idle) {
     timeval tv{1, 0};
-    ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ::setsockopt(socket_->raw_fd(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
   }
 
   std::vector<char> buf(65536);
   while (true) {
-    ssize_t n = ::recv(fd_, buf.data(), buf.size(), 0);
+    long n = socket_->read(buf.data(), buf.size());
     if (n < 0) {
       if (on_idle && (errno == EAGAIN || errno == EWOULDBLOCK)) {
         on_idle();
@@ -152,7 +148,7 @@ ssize_t WsConnection::recv_cb(wslay_event_context_ptr ctx, uint8_t *buf, size_t 
 
 ssize_t WsConnection::send_cb(wslay_event_context_ptr ctx, const uint8_t *data, size_t len, int, void *user_data) {
   auto *self = static_cast<WsConnection *>(user_data);
-  ssize_t sent = ::send(self->fd_, data, len, MSG_NOSIGNAL);
+  long sent = self->socket_->write(data, len);
   if (sent <= 0) {
     wslay_event_set_error(ctx, WSLAY_ERR_CALLBACK_FAILURE);
     return -1;
